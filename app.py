@@ -6,6 +6,8 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_community.retrievers import BM25Retriever
+from langchain_classic.retrievers.ensemble import EnsembleRetriever
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -23,13 +25,27 @@ def get_embeddings():
 def get_llm():
     return ChatGoogleGenerativeAI(model="gemini-3.6-flash")
 
-def build_vectorstore(pdf_path):
+def build_retriever(pdf_path):
     loader = PyPDFLoader(pdf_path)
     documents = loader.load()
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_documents(documents)
+
+    # Vector-based retriever (semantic/meaning search)
     embeddings = get_embeddings()
-    return FAISS.from_documents(chunks, embeddings)
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+
+    # Keyword-based retriever (exact term search)
+    bm25_retriever = BM25Retriever.from_documents(chunks)
+    bm25_retriever.k = 3
+
+    # Combine both — weighted equally
+    hybrid_retriever = EnsembleRetriever(
+        retrievers=[vector_retriever, bm25_retriever],
+        weights=[0.5, 0.5],
+    )
+    return hybrid_retriever
 
 prompt = ChatPromptTemplate.from_template(
     "Answer the question using only the following context. "
@@ -39,8 +55,8 @@ prompt = ChatPromptTemplate.from_template(
     "Answer:"
 )
 
-def ask(vectorstore, llm, question, k=3):
-    retrieved_docs = vectorstore.similarity_search(question, k=k)
+def ask(retriever, llm, question):
+    retrieved_docs = retriever.invoke(question)
     context = "\n\n".join(doc.page_content for doc in retrieved_docs)
     chain = prompt | llm
     response = chain.invoke({"context": context, "question": question})
@@ -60,18 +76,18 @@ with st.sidebar:
         file_hash = hash(file_bytes)
 
     if uploaded_file and st.session_state.get("last_file_hash") != file_hash:
-        with st.spinner("Reading and indexing your PDF..."):
+        with st.spinner("Reading and indexing your PDF (vector + keyword search)..."):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(uploaded_file.read())
                 tmp_path = tmp.name
-            st.session_state.vectorstore = build_vectorstore(tmp_path)
+            st.session_state.retriever = build_retriever(tmp_path)
             os.unlink(tmp_path)
             st.session_state.last_file_hash = file_hash
             st.session_state.messages = []
         st.success(f"Indexed: {uploaded_file.name}")
 
 # --- Main chat area ---
-if "vectorstore" not in st.session_state:
+if "retriever" not in st.session_state:
     st.info("👈 Upload a PDF in the sidebar to get started.")
     st.stop()
 
@@ -91,7 +107,7 @@ if question := st.chat_input("Ask a question about the document..."):
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            answer, sources = ask(st.session_state.vectorstore, llm, question)
+            answer, sources = ask(st.session_state.retriever, llm, question)
         st.markdown(answer)
         with st.expander("📚 Sources used"):
             for i, doc in enumerate(sources, 1):
