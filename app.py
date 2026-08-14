@@ -10,6 +10,7 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers.ensemble import EnsembleRetriever
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
+from sentence_transformers import CrossEncoder
 
 load_dotenv()
 
@@ -25,6 +26,10 @@ def get_embeddings():
 def get_llm():
     return ChatGoogleGenerativeAI(model="gemini-3.6-flash")
 
+@st.cache_resource(show_spinner=False)
+def get_reranker():
+    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
 def build_retriever(pdf_path):
     loader = PyPDFLoader(pdf_path)
     documents = loader.load()
@@ -34,11 +39,11 @@ def build_retriever(pdf_path):
     # Vector-based retriever (semantic/meaning search)
     embeddings = get_embeddings()
     vectorstore = FAISS.from_documents(chunks, embeddings)
-    vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
     # Keyword-based retriever (exact term search)
     bm25_retriever = BM25Retriever.from_documents(chunks)
-    bm25_retriever.k = 3
+    bm25_retriever.k = 5
 
     # Combine both — weighted equally
     hybrid_retriever = EnsembleRetriever(
@@ -55,8 +60,15 @@ prompt = ChatPromptTemplate.from_template(
     "Answer:"
 )
 
-def ask(retriever, llm, question):
+def ask(retriever, llm, reranker, question, top_n=3):
     retrieved_docs = retriever.invoke(question)
+
+    # Rerank: score each chunk's relevance to the question, keep the best ones
+    pairs = [[question, doc.page_content] for doc in retrieved_docs]
+    scores = reranker.predict(pairs)
+    ranked = sorted(zip(scores, retrieved_docs), key=lambda x: x[0], reverse=True)
+    retrieved_docs = [doc for _, doc in ranked[:top_n]]
+
     context = "\n\n".join(doc.page_content for doc in retrieved_docs)
     chain = prompt | llm
     response = chain.invoke({"context": context, "question": question})
@@ -92,6 +104,7 @@ if "retriever" not in st.session_state:
     st.stop()
 
 llm = get_llm()
+reranker = get_reranker()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -107,7 +120,7 @@ if question := st.chat_input("Ask a question about the document..."):
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            answer, sources = ask(st.session_state.retriever, llm, question)
+            answer, sources = ask(st.session_state.retriever, llm, reranker, question)
         st.markdown(answer)
         with st.expander("📚 Sources used"):
             for i, doc in enumerate(sources, 1):
